@@ -130,8 +130,10 @@ VIDEO_URLS = [
 ]
 
 # Pip requirements for the base project (root + tests)
+# NOTE: NumPy is intentionally pinned to a specific pre-2.0 release to avoid resolver drift
+# and to match the HailoRT wheels' "<2" requirement on aarch64.
 BASE_REQUIREMENTS = [
-    "numpy<2.0.0",
+    "numpy==1.26.4",
     "setproctitle",
     "opencv-python",
     "pytest",
@@ -250,7 +252,8 @@ def ensure_dirs():
     (REPO_DIR / "offline_wheels" / "base").mkdir(parents=True, exist_ok=True)
     (REPO_DIR / "offline_wheels" / "hailo").mkdir(parents=True, exist_ok=True)
     # (REPO_DIR / "offline_wheels" / "community").mkdir(parents=True, exist_ok=True)  # DISABLED: see rationale above
-    (REPO_DIR / "offline_wheels" / "hailo_apps_infra").mkdir(parents=True, exist_ok=True)  # NEW: apps-infra deps
+    (REPO_DIR / "offline_wheels" / "hailo_apps_infra").mkdir(parents=True, exist_ok=True)  # apps-infra deps
+    (REPO_DIR / "offline_wheels" / "hailo_apps_infra_build").mkdir(parents=True, exist_ok=True)  # Build backend
     (REPO_DIR / "third_party").mkdir(parents=True, exist_ok=True)
 
 def filename_from_url(u: str) -> str:
@@ -464,7 +467,7 @@ def patch_config_yaml_for_local_infra():
         cfg.write_text(new_text, encoding="utf-8")
         print("  config.yaml patched (backup saved as config.yaml.bak).")
 
-# ---------- NEW: Mirror hailo-apps-infra Python dependencies (exact wheels + transitive deps) ----------
+# ---------- Mirror hailo-apps-infra Python dependencies (exact wheels + transitive deps) ----------
 def _parse_apps_infra_dependencies(pyproject_path: Path):
     """
     Minimal, robust parser for the [project] dependencies array in pyproject.toml.
@@ -527,7 +530,22 @@ def download_hailo_apps_infra_deps(py_ver: str, apps_infra_root: Path):
     pip_download(deps, dest, py_ver, abi, plat)
     print("hailo-apps-infra dependency wheels downloaded.")
 
-# ---------- NEW: write a Heredoc README with offline install steps ----------
+# ---------- Mirror the build backend (setuptools, wheel) used by hailo-apps-infra ----------
+def download_hailo_apps_infra_build_backend(py_ver: str):
+    """
+    Mirror the build backend declared in hailo-apps-infra's pyproject:
+      [build-system] requires = ["setuptools>=61.0", "wheel"]
+    These must be installed on the Pi BEFORE `pip install -e third_party/hailo-apps-infra`
+    to avoid any network access during editable install.
+    """
+    print("Downloading hailo-apps-infra build backend wheels (setuptools, wheel) ...")
+    dest = REPO_DIR / "offline_wheels" / "hailo_apps_infra_build"
+    abi = compute_abi(py_ver)
+    plat = "manylinux2014_aarch64"
+    pip_download(["setuptools>=61.0", "wheel"], dest, py_ver, abi, plat)
+    print("hailo-apps-infra build backend wheels downloaded.")
+
+# ---------- Write a Heredoc README with offline install steps ----------
 def write_offline_readme(py_ver: str):
     readme_path = REPO_DIR / "OFFLINE_INSTALL_README.txt"
     contents = textwrap.dedent(f"""
@@ -541,6 +559,7 @@ def write_offline_readme(py_ver: str):
       * Hailo Python wheels (hailort + tappas_core_python_binding) (./offline_wheels/hailo).
       * hailo-apps-infra code (./third_party/hailo-apps-infra) and its mirrored deps
         (./offline_wheels/hailo_apps_infra).
+      * Build backend wheels for hailo-apps-infra (./offline_wheels/hailo_apps_infra_build).
 
     Prereqs on the Pi (already mirrored via apt by you):
       - python3-venv, python3, pip
@@ -557,20 +576,23 @@ def write_offline_readme(py_ver: str):
     ------------------------------------------------------------------------------
     2) Install Python wheels OFFLINE (no network)
     ------------------------------------------------------------------------------
-      # Base project deps (pytest etc.)
+      # (A) Install build backend required by hailo-apps-infra editable install
+      pip install --no-index --find-links offline_wheels/hailo_apps_infra_build setuptools wheel
+
+      # (B) Base project deps (pytest etc.)
       pip install --no-index --find-links offline_wheels/base -r requirements.txt
 
-      # Hailo Python wheels (exact wheels provided)
+      # (C) Hailo Python wheels (exact wheels provided)
       pip install --no-index --find-links offline_wheels/hailo \\
           offline_wheels/hailo/hailort-*.whl \\
           offline_wheels/hailo/tappas_core_python_binding-*.whl
 
-      # hailo-apps-infra dependencies (resolved + mirrored, including transitives)
+      # (D) hailo-apps-infra dependencies (resolved + mirrored, including transitives)
       pip install --no-index --find-links offline_wheels/hailo_apps_infra \\
           numpy 'setproctitle' 'opencv-python' 'python-dotenv' 'pyyaml' 'gradio' \\
           'fastrtc' 'lancedb' 'matplotlib' 'Pillow'
 
-      # Finally, install hailo-apps-infra from local source (editable)
+      # (E) Finally, install hailo-apps-infra from local source (editable)
       pip install -e third_party/hailo-apps-infra
 
     ------------------------------------------------------------------------------
@@ -625,7 +647,9 @@ def main():
     download_base_wheels(args.python_version)
     download_hailo_wheels(args.python_version)
     clone_hailo_apps_infra(args.infra_tag)
-    # NEW: after the clone, parse its pyproject and mirror ALL deps (with transitives) for aarch64/cp311
+    # Mirror build backend for hailo-apps-infra editable install
+    download_hailo_apps_infra_build_backend(args.python_version)
+    # After the clone, parse its pyproject and mirror ALL deps (with transitives) for aarch64/cp311
     download_hailo_apps_infra_deps(args.python_version, REPO_DIR / "third_party" / "hailo-apps-infra")
     # download_community_wheels(args.python_version, include=(not args.skip_community))  # DISABLED: see rationale
     patch_gitignore()
@@ -640,13 +664,20 @@ def main():
           3) In that folder on the Pi:
                 source ./setup_env.sh
                 # Install wheels fully OFFLINE:
-                #   - Base project wheels
+
+                #   - (A) Build backend required by hailo-apps-infra editable install
+                pip install --no-index --find-links offline_wheels/hailo_apps_infra_build setuptools wheel
+
+                #   - (B) Base project wheels
                 pip install --no-index --find-links offline_wheels/base -r requirements.txt
-                #   - Hailo wheels
+
+                #   - (C) Hailo wheels
                 pip install --no-index --find-links offline_wheels/hailo offline_wheels/hailo/hailort-*.whl offline_wheels/hailo/tappas_core_python_binding-*.whl
-                #   - Apps-Infra dependencies (resolved snapshot, including transitives)
+
+                #   - (D) Apps-Infra dependencies (resolved snapshot, including transitives)
                 pip install --no-index --find-links offline_wheels/hailo_apps_infra pyyaml gradio fastrtc lancedb matplotlib Pillow
-                #   - Apps-Infra package (editable, from local clone)
+
+                #   - (E) Apps-Infra package (editable, from local clone)
                 pip install -e third_party/hailo-apps-infra
 
           4) Run examples, e.g.:
