@@ -104,6 +104,19 @@ def run_checked(cmd: List[str], cwd: Optional[Path] = None, env: Optional[Mappin
     print(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, cwd=str(cwd) if cwd else None, env=dict(env) if env else None, check=True)
 
+def _env_with_sitefirst(site_dir: Path) -> Mapping[str, str]:
+    """
+    CRITICAL: ensures the venv’s sitecustomize.py is the one Python imports.
+    Puts <venv>/site-packages before stdlib on sys.path for every child Python.
+    Without this, the system /usr/lib/python3.12/sitecustomize.py may win,
+    our patch won’t run, and pip will use HOST markers (wrong behavior).
+    """
+    e = dict(os.environ)
+    prefix = str(site_dir)
+    cur = e.get("PYTHONPATH", "")
+    e["PYTHONPATH"] = f"{prefix}:{cur}" if cur else prefix
+    return e
+
 
 # ----------------------- Marker JSON + Sanity Checks --------------------------
 
@@ -258,8 +271,9 @@ def create_locked_venv(tmp_root: Path, verbose: bool) -> VenvPaths:
     # Validate pip version is what we think.
     out = subprocess.check_output([str(vp.python), "-m", "pip", "--version"], text=True)
     # Example: "pip 24.0 from /.../site-packages/pip (python 3.12)"
-    m = re.match(r"^pip\s+(\S+)\s+", out.strip())
-    if not m or m.group(1) != REQUIRED_PIP_VERSION:
+    m = re.match(r"^pip\s+([^\s]+)", out.strip())
+    ver = m.group(1) if m else None
+    if ver != REQUIRED_PIP_VERSION:
         die(f"Expected pip=={REQUIRED_PIP_VERSION} inside venv, got: {out.strip()}")
 
     if verbose:
@@ -352,30 +366,12 @@ def _patch_module(mod, target_env):
     mod.default_environment = forced_de
     mod.Marker.evaluate = forced_eval  # type: ignore[attr-defined]
 
-    # quick smoke-test: host vs target should diverge if versions differ
-    # e.g., for our real-world issue: "python_full_version < '3.12'"
-    from types import SimpleNamespace
-    class _FakeVar:
-        def __init__(self, value): self.value = value
-        def serialize(self): return str(self.value)
-    class _FakeOp:
-        def __init__(self, op): self._op = op
-        def serialize(self): return self._op
-    class _FakeVal:
-        def __init__(self, v): self.value = v
-        def serialize(self): return f'"{{self.value}}"'
-    # A simple parsed marker tuple: (Variable('python_full_version'), Op('<'), Value('3.12'))
-    tuple_marker = [(_FakeVar("python_full_version"), _FakeOp("<"), _FakeVal("3.12"))]
-    # Evaluate via module's machinery
-    def _eval_for(mod_):
-        class _M:
-            _markers = tuple_marker
-        M = _M()
-        return mod_.Marker.evaluate(M, None)  # type: ignore
-
-    test = _eval_for(mod)
-    if not isinstance(test, bool):
-        _die(f"Sanity test failed for {{mod.__name__}} evaluate path (not bool)")
+    # Smoke test using a real parsed marker (the exact path pip uses).
+    try:
+        m = mod.Marker('python_full_version < "3.12"')
+        _ = bool(mod.Marker.evaluate(m, None))
+    except Exception as e:
+        _die(f"Sanity test failed for {{mod.__name__}}: {{e!r}}")
 
 def _main():
     _assert_pip_version()
@@ -414,15 +410,17 @@ _main()
 
 def write_sitecustomize(site_dir: Path, verbose: bool) -> Path:
     sc = site_dir / "sitecustomize.py"
+    uc = site_dir / "usercustomize.py"
     if sc.exists():
         die(f"Refusing to overwrite existing {sc}")
     sc.write_text(SITECUSTOMIZE_CODE, encoding="utf-8")
+    uc.write_text(SITECUSTOMIZE_CODE, encoding="utf-8")
     if verbose:
-        print(f"Wrote patch injector: {sc}")
+        print(f"Wrote patch injector: {sc} and {uc}")
     return sc
 
 
-def validate_patch_effect(vpython: Path, target: TargetEnv, verbose: bool) -> None:
+def validate_patch_effect(vpython: Path, target: TargetEnv, verbose: bool, env: Optional[Mapping[str, str]] = None) -> None:
     # Validate that the patched default_environment returns exactly the target JSON (stringified)
     code = r"""
 import json
@@ -441,7 +439,7 @@ if pm is not None:
     print(json.dumps(env2, sort_keys=True))
     print("OK-EXTERNAL")
 """
-    out = subprocess.check_output([str(vpython), "-c", code], text=True, cwd=os.getcwd())
+    out = subprocess.check_output([str(vpython), "-c", code], text=True, cwd=os.getcwd(), env=env)
     lines = [l for l in out.splitlines() if l.strip()]
     # Expect at least 2 lines: json then "OK-VENDORED"
     if "OK-VENDORED" not in lines[-1] and "OK-VENDORED" not in lines[-2:]:
@@ -464,7 +462,7 @@ if pm is not None:
 
 # ------------------------------ Download --------------------------------------
 
-def pip_download_in_venv(vp: VenvPaths, env: TargetEnv, dest_dir: Path, platform_tag: str, packages: List[str]) -> None:
+def pip_download_in_venv(vp: VenvPaths, env: TargetEnv, dest_dir: Path, platform_tag: str, packages: List[str], run_env: Optional[Mapping[str, str]] = None) -> None:
     cmd = [
         str(vp.python), "-m", "pip", "download",
         "--only-binary", ":all:",
@@ -477,7 +475,7 @@ def pip_download_in_venv(vp: VenvPaths, env: TargetEnv, dest_dir: Path, platform
     print("\nInvoking pip download with TARGET markers:")
     print(f"  python_version={env.py_version_twodot}  abi={env.abi_tag}  platform={platform_tag}")
     print(f"  dest={dest_dir}")
-    run_checked(cmd)
+    run_checked(cmd, env=run_env)
 
 
 # --------------------------------- Main ---------------------------------------
@@ -505,6 +503,7 @@ def main() -> None:
 
         # Inject our sitecustomize patch into the venv's site-packages
         write_sitecustomize(vp.site_packages, verbose)
+        pyenv = _env_with_sitefirst(vp.site_packages)
 
         # Sanity: demonstrate host vs target marker divergence specifically for the real bug.
         # Host is Ubuntu 24.04 Python 3.12.*, Target example is Python 3.11.2 on Pi.
@@ -516,25 +515,24 @@ def main() -> None:
         # Now ask the venv to compute via patched vendored packaging
         code = r"""
 from pip._vendor.packaging import markers as vm
+import sys
 m = vm.Marker('python_full_version < "3.12"')
-print("TARGET_COND=", "T" if m.evaluate() else "F")
+sys.exit(0 if m.evaluate() else 1)
 """
-        out = subprocess.check_output([str(vp.python), "-c", code], text=True, cwd=os.getcwd()).strip()
-        if "TARGET_COND= T" not in out and "TARGET_COND=T" not in out:
-            die("Patched Marker.evaluate did not return True for target 'python_full_version < 3.12' check.")
+        subprocess.run([str(vp.python), "-c", code], check=True, text=True, cwd=os.getcwd(), env=pyenv)
 
         if verbose:
             print(f"Host python_full_version={host_full}  -> condition <3.12? {host_truth}")
-            print(out)
+            print("Target evaluation for <3.12 exited with code 0")
 
         # Double-check our patched module returns exactly the provided environment
-        validate_patch_effect(vp.python, target, verbose)
+        validate_patch_effect(vp.python, target, verbose, env=pyenv)
 
         # Create destination folder (must not exist yet)
         dest.mkdir(parents=False, exist_ok=False)
 
         # Finally perform the download as the TARGET
-        pip_download_in_venv(vp, target, dest, args.platform_tag, args.packages)
+        pip_download_in_venv(vp, target, dest, args.platform_tag, args.packages, run_env=pyenv)
 
         print("\nDownload complete.")
         print(f"Wheels saved to: {dest}")
