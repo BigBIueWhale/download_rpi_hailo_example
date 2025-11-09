@@ -172,7 +172,7 @@ python3 - <<'PY'
 import json, os, platform, sys
 
 def format_full_version(v):
-    s = f"{v.major}.{v.minor}.{v.micro}"
+    s = f"{{v.major}}.{{v.minor}}.{{v.micro}}"
     if v.releaselevel != "final":
         s += v.releaselevel[0] + str(v.serial)
     return s
