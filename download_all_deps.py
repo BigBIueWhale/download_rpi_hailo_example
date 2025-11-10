@@ -616,7 +616,7 @@ def write_offline_readme(py_ver: str):
           'fastrtc' 'lancedb' 'matplotlib' 'Pillow'
 
       # (E) Finally, install hailo-apps-infra from local source (editable)
-      pip install -e third_party/hailo-apps-infra
+      pip install --no-index --find-links offline_wheels/hailo_apps_infra_build -e third_party/hailo-apps-infra
 
     ------------------------------------------------------------------------------
     3) (Optional) Ensure models are also available system-wide
